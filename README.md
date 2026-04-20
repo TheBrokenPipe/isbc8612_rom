@@ -13,8 +13,8 @@ To build, run:
 bash build.sh
 ```
 
-The output will be saved to [`output/bin/SBCMON.BIN`](./output/bin), with
-objects and listings in [`output/obj`](./output/obj).
+The output will be saved to [`output/bin/SBCMON.BIN`](./output/bin/SBCMON.BIN),
+with objects and listings in [`output/obj`](./output/obj).
 
 Note that this toolchain uses PL/M-86 Compiler version 1.2, not the version
 1.0 Intel used, because version 1.0 is not available. This will not produce
