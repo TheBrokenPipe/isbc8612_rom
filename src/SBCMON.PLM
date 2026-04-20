@@ -1,0 +1,1647 @@
+$TITLE('ISBC 86/12 MONITOR')
+$NOINTVECTOR
+
+ /* ****************************************************************
+    ****************************************************************
+
+         ISBC 86/12 MONITOR, V1.2
+         18 JULY 1978
+
+         (C) 1978 INTEL CORPORATION. ALL RIGHTS RESERVED. NO PART
+    OF THIS PROGRAM OR PUBLICATION MAY BE REPRODUCED, TRANSMITTED,
+    TRANSCRIBED, STORED IN A RETRIEVAL SYSTEM, OR TRANSLATED INTO ANY
+    LANGUAGE, IN ANY FORM OR BY ANY MEANS, ELECTRONIC, MECHANICAL,
+    MAGNETIC, OPTICAL, CHEMICAL, MANUAL OR OTHERWISE, WITHOUT THE PRIOR
+    WRITTEN PERMISSION OF INTEL CORPORATION, 3065 BOWERS AVENUE, SANTA
+    CLARA, CALIFORNIA, 95051.
+
+    ****************************************************************
+    ****************************************************************
+
+    ABSTRACT
+    ========
+    THIS PROGRAM IS THE ROM BASED MONITOR FOR THE ISBC 86/12.  IT PROVIDES
+    THE USER WITH A MODERATE LEVEL OF CAPABILITY TO EXAMINE/MODIFY
+    MEMORY AND REGISTERS, CONTROL PROGRAM EXECUTION, AND LOAD/SAVE
+    PROGRAMS.
+
+    ENVIRONMENT
+    ===========
+    THE SBC MONITOR COMMUNICATES WITH THE USER VIA AN INTERACTIVE
+    TERMINAL (TTY,CRT) ATTACHED TO THE SERIAL PORT.
+
+    PROGRAM ORGANIZATION
+    ====================
+    THE PROGRAM IS DIVIDED INTO 1 DATA AND 2 CODE MODULES:
+       1. DATA DECLARATION MODULE.    GLOBAL DATA DECLARATIONS.
+       2. COMMON ROUTINES.            LOWER LEVEL PROCEDURES
+       3. COMMAND MODULE.             INDIVIDUAL COMMANDS AND OUTER BLOCK
+
+    CALLING GRAPH
+    =============
+       >>COMMAND DISPATCH MODULE (OUTER BLOCK)
+            INDIVIDUAL COMMAND PROCEDURES
+               COMMON ROUTINES
+
+    GLOBAL DATA STRUCTURES
+    ======================
+    THE MONITOR MAINTAINS THE USER'S MACHINE STATE (REGISTERS) IN A
+    WORD ARRAY. THE REGISTERS ARE SAVED FROM THE USER'S STACK
+    AS PUSHED BY PLM86 INTERRUPT PROCEDURE.
+    POINTERS TO THE 2**20 ADDRESS SPACE ARE IMPLEMENTED WITH
+    POINTER STRUCTURES ALLOCATED AS 2 WORD STRUCTURES.
+
+ */
+
+    MONITOR:DO;                     /* BEGINNING OF MODULE */
+
+ /* ****************************************************************
+    ****************************************************************
+
+                   GLOBAL DATA DECLARATIONS MODULE
+                   ===============================
+    ABSTRACT
+    ========
+    THIS MODULE CONTAINS ALL THE GLOBAL DATA DECLARATIONS AND
+    LITERALS (EQUATES).
+
+    MODULE ORGAINIZATION
+    ====================
+    THE MODULE IS DIVIDED INTO 5 SECTIONS:
+       1. UTILITY SECTION             GLOBAL FLAGS,VARIBLES,EQUATES
+       2. I/O SECTION                 I/O PORTS,MASKS,AND SPECIAL CHARS
+       3. MEMORY ARGUMENTS SECTIONS   STRUCTURES FOR POINTERS
+       4. REGISTER SECTION            USER REGISTER SAVE AREA
+ */
+
+    /**********************
+    *   UTILITY SECTION   *
+    **********************/
+
+ DECLARE
+        INT$VECTOR(40)     POINTER;             /* INTERRUPT VECTORS */
+ DECLARE
+        MONITOR$STACKPTR   WORD,
+        MONITOR$STACKBASE  WORD;
+ DECLARE
+        INT3$PTR           POINTER;             /* INTERRUPT3$ENTRY ADDRESS */
+ DECLARE
+        COPYRIGHT(*) BYTE DATA ('(C) 1978 INTEL CORP');
+ DECLARE
+        BRK1$FLAG       BYTE,                   /* TRUE IF BREAK SET */
+        BRK1$SAVE       BYTE,                   /* INST BREAK SAVE */
+        BRK2$FLAG       BYTE,                   /* TRUE IF BREAK 2 SET */
+        BRK2$SAVE       BYTE,                   /* INST BREAK 2 SAVE */
+        CHAR            BYTE,                   /* ONE CHAR LOOK AHEAD */
+        CHECK$SUM       BYTE,                   /* PAPER TAPE CHECKSUM */
+        I               BYTE,                   /* INDEX */
+        J               BYTE,                   /* INDEX */
+        II              WORD,                   /* INDEX */
+        JJ              WORD,                   /* INDEX */
+        END$OFF         WORD,                   /* END OFFSET ADDRESS */
+        WORD$MODE       BYTE,                   /* WORD MODE FLAG */
+        LAST$COMMAND    BYTE,                   /* LAST COMMAND SAVE */
+        MODE            BYTE,                  /* R, W, L & T MODE */
+        SAVE$MODE       BYTE,                  /* SAVE MODE */
+        SWITCH$BAUD     BYTE,                  /* BAUD RATE SWITCH FLAG */
+        MODE$8086       BYTE,                  /* 8086 FILE FORMAT */
+        BRF             WORD;                  /* BAUD RATE FACTOR */
+
+ DECLARE
+        TRUE            LITERALLY '0FFH',
+        FALSE           LITERALLY '000H',
+        BREAK$INST      LITERALLY '0CCH',       /* BREAKPOINT INST */
+        STEP$TRAP       LITERALLY '0100H',      /* SS TRAP FLAG MASK */
+        USER$INIT$SP    LITERALLY '1C0H',       /* USER STACK INITIAL */
+        GO$COMMAND      LITERALLY '2',          /* GO COMMAND CODE */
+        SS$COMMAND      LITERALLY '3',          /* SINGLE STEP CODE */
+        STANDARD$LEN    LITERALLY '16',         /* PAPER TAPE DATA REC LEN */
+        MAX$DELAY       LITERALLY '60000',      /* DELAY FOR READ CHAR */
+        TAPE            LITERALLY '1H',         /* TAPE MODE */
+        SERIAL          LITERALLY '2H',         /* SERIAL MODE */
+        PARALLEL        LITERALLY '4H',         /* PARALLEL MODE */
+        ASCR            LITERALLY  '0DH',       /* CARRIAGE RETURN */
+        ASLF            LITERALLY  '0AH',       /* LINE FEED       */
+        ASBL            LITERALLY  '20H';       /* BLANK OR SPACE  */
+ DECLARE
+        SIO$BREAK1$MSG(*) BYTE DATA  ('BR1 ',0),
+        SIO$BREAK2$MSG(*) BYTE DATA  ('BR2 ',0),
+        SIO$SIGNON(*)    BYTE DATA  (0DH,0AH,'ISBC 86/12 MONITOR, V1.2',0),
+        ASCII(*)        BYTE DATA  ('0123456789ABCDEF'),
+        SIO$CMND(*)     BYTE DATA  ('SXGNMDCFHIORWLT'),
+        BR$CHAR(*)      BYTE DATA  (55H,66H,78H);
+
+    /*******************************
+    *   I/O DECLARATIONS SECTION   *
+    *******************************/
+
+ DECLARE                                        /* 8251A USART */
+        SIO$STAT$PORT   LITERALLY '0DAH',       /* STATUS PORT */
+        SIO$DATA$PORT   LITERALLY '0D8H',       /* DATA PORT */
+        SIO$RESET       LITERALLY '40H',        /* RESET USART */
+        SIO$CRT$MODE    LITERALLY '4EH',        /* CRT MODE */
+        SIO$TTY$MODE    LITERALLY '0CFH',       /* TTY MODE */
+        SIO$DTR$ON      LITERALLY '27H',        /* RTS,RXE,DTR,TXE */
+        SIO$CRT$CMD     LITERALLY '37H',        /* RTS,ER,RXE,DTR,TXE */
+        SIO$TTY$CMD     LITERALLY '35H',        /* RTS,ER,RXE,TXE */
+        SIO$DTR$OFF     LITERALLY '25H',        /* RTS,RXE,TXE */
+        SIO$RXRDY       LITERALLY '02H',        /* RECEIVER READY */
+        SIO$TXE         LITERALLY '04H',        /* TRANSMITTER EMPTY */
+        SIO$TXRDY       LITERALLY '01H',        /* TRANSMITTER READY */
+        PARITY$MASK     LITERALLY '7FH';        /* MASK OFF PARITY BIT */
+
+ DECLARE                                        /* 8253 INTERVAL TIMER */
+        IT$CONTROL$PORT LITERALLY '0D6H',       /* CONTROL PORT */
+        IT$CTR2$PORT    LITERALLY '0D4H',       /* COUNTER 2 PORT */
+        IT$C2M3         LITERALLY '0B6H',       /* COUNTER 2, MODE 3 */
+        B9600           LITERALLY '0008H',      /* TIMER VALUE FOR 9600 BAUD */
+        B1200           LITERALLY '0040H',     /* TIMER VALUE FOR 1200 BAUD */
+        B600            LITERALLY '0080H',      /* TIMER VALUE FOR 600 BAUD */
+        B110            LITERALLY '00AFH';     /* TIMER VALUE FOR 110 BAUD */
+
+ DECLARE                                        /* 8259A INTERRUPT CONTROLLER */
+        IC$PORTA        LITERALLY '0C0H',       /* PORT A */
+        IC$PORTB        LITERALLY '0C2H',       /* PORT B */
+        IC$ICW1         LITERALLY '17H',        /* INIT COMMAND WORD 1 */
+        IC$ICW2         LITERALLY '20H',        /* INIT COMMAND WORD 2 */
+        IC$ICW4         LITERALLY '1DH',        /* INIT COMMAND WORD 4 */
+        IC$MASK         LITERALLY '00H',        /* INTERRUPT MASK */
+        IC$OCW3         LITERALLY '0BH',        /* READ INTERRUPT LEVEL */
+        IC$EOI          LITERALLY '20H';        /* END OF INTERRUPT CMD */
+
+ DECLARE                                     /* 8255A PERIPHERAL INTERFACE */
+        PI$PORTA        LITERALLY '0C8H',       /* PORT A (OUTPUT) */
+        PI$PORTB        LITERALLY '0CAH',       /* PORT B (INPUT) */
+        PI$PORTC$STAT   LITERALLY '0CCH',       /* PORT C STATUS */
+        PI$PORTC$CTL    LITERALLY '0CEH',       /* PORT C CONTROL */
+        PI$M2M1         LITERALLY '0C6H',       /* A-MODE 1, B-MODE 2 */
+        PI$OBF          LITERALLY '080H',       /* OUTPUT BUFFER READY */
+        PI$IBF          LITERALLY '02H';        /* INPUT BUFFER READY */
+
+    /******************************
+    *   MEMORY ARGUMENT SECTION   *
+    ******************************/
+
+ DECLARE
+        MEMORY$ARG1$PTR  POINTER,               /* ARGUMENT 1 */
+        ARG1 STRUCTURE (OFF WORD, SEG WORD)
+           AT (@MEMORY$ARG1$PTR),
+        MEMORY$ARG1 BASED MEMORY$ARG1$PTR BYTE,
+        MEMORY$WORD$ARG1 BASED MEMORY$ARG1$PTR WORD,
+
+        MEMORY$ARG2$PTR POINTER,                 /* ARGUMENT 2 */
+        ARG2 STRUCTURE (OFF WORD, SEG WORD)
+           AT (@MEMORY$ARG2$PTR),
+        MEMORY$ARG2 BASED MEMORY$ARG2$PTR BYTE,
+
+        MEMORY$ARG3$PTR POINTER,                /* ARGUMENT 3 */
+        ARG3 STRUCTURE (OFF WORD, SEG WORD)
+           AT (@MEMORY$ARG3$PTR),
+        MEMORY$ARG3 BASED MEMORY$ARG3$PTR BYTE,
+
+        MEMORY$BRK1$PTR POINTER,                /* BREAKPOINT 1 */
+        BRK1 STRUCTURE (OFF WORD, SEG WORD)
+           AT (@MEMORY$BRK1$PTR),
+        MEMORY$BRK1 BASED MEMORY$BRK1$PTR BYTE,
+
+        MEMORY$BRK2$PTR POINTER,               /* BREAKPOINT 2 */
+        BRK2 STRUCTURE (OFF WORD, SEG WORD)
+           AT (@MEMORY$BRK2$PTR),
+        MEMORY$BRK2 BASED MEMORY$BRK2$PTR BYTE,
+
+        MEMORY$CSIP$PTR POINTER,                /* CS & IP WORD */
+        CSIP STRUCTURE (OFF WORD, SEG WORD)
+           AT (@MEMORY$CSIP$PTR),
+        MEMORY$CSIP BASED MEMORY$CSIP$PTR BYTE,
+
+        MEMORY$USERSTACK$PTR POINTER,
+        USERSTACK STRUCTURE (OFF WORD, SEG WORD)
+           AT (@MEMORY$USERSTACK$PTR),
+        MEMORY$USERSTACK BASED MEMORY$USERSTACK$PTR WORD;
+
+    /***********************
+    *   REGISTER SECTION   *
+    ***********************/
+
+ DECLARE
+        REG(*)          BYTE DATA              /* REGISTER NAMES */
+           ('AXBXCXDXSPBPSIDICSDSSSESIPFL'),
+        REG$INDEX       WORD,
+        REG$SAV(14)     WORD,               /* USER'S SAVED REGS */
+        REG$ORD(*)      BYTE DATA
+           (7,6,1,3,2,0,9,11,12,8,13),
+        SP              LITERALLY 'REG$SAV( 4)',
+        BP              LITERALLY 'REG$SAV( 5)',
+        CS              LITERALLY 'REG$SAV( 8)',
+        DS              LITERALLY 'REG$SAV( 9)',
+        SS              LITERALLY 'REG$SAV(10)',
+        ES              LITERALLY 'REG$SAV(11)',
+        IP              LITERALLY 'REG$SAV(12)',
+        FL              LITERALLY 'REG$SAV(13)';
+
+
+
+ /* *****************************************************************
+    *****************************************************************
+
+                    COMMON PROCEDURES
+                    =================
+    ABSTRACT
+    ========
+    THIS MODULE CONTAINS THOSE LOWER LEVEL PROCEDURES CALLED BY HIGHER
+    LEVEL ROUTINES.
+
+    MODULE ORGANIZATION
+    ===================
+    THIS MODULE IS DIVIDED INTO 4 SECTIONS AS FOLLOWS:
+       1. BASIC I/O SECTION
+           SIO$CHAR$RDY         INPUT CHARACTER READY
+           SIO$CHECK$CONTROL$CHAR  CHECK FOR CONTROL CHARACTER
+           SIO$OUT$CHAR         OUTPUT CHARACTER
+           SIO$GET$CHAR         INPUT A CHARACTER
+           SIO$OUT$BYTE         OUTPUT A BYTE IN HEX
+           SIO$OUT$BYTE$PTR     OUTPUT BYTE AT POINTER
+           SIO$OUT$WORD         OUTPUT A WORD IN HEX
+           SIO$OUT$BLANK        OUTPUT A SINGLE BLANK
+           SIO$OUT$STRING       OUTPUT A STRING
+           SIO$OUT$HEADER       OUTPUT A HEX FILE HEADER
+       2. UTILITY ROUTINES SECTION
+           SIO$VALID$HEX        TEST FOR VALID HEX CHAR
+           SIO$HEX              CONVERT TO HEX FROM ASCII
+           SIO$VALID$REG$FIRST  TEST FOR VALID REGISTER FIRST CHAR
+           SIO$VALID$REG        TEST FOR VALID REGISTER NAME
+           SIO$CRLF             OUTPUTS A CR AND LF
+           SIO$TEST$WORD$MODE   TEST FOR A 'W' IN COMMAND
+           SIO$SCAN$BLANK       SCANS FOR OPTIONAL BLANK
+           SIO$SECOND$DELAY     DELAY ONE SECOND
+           SIO$MS$DELAY         DELAY N MS.
+       3. ARGUMENT EXPRESSION EVALUATION SECTION
+           SIO$GET$WORD         GET AN WORD EXPRESSION
+           SIO$GET$ADDR         GET AN ADDRESS EXPRESSION
+           SIO$UPDATE$IP        OPTIONAL UPDATE OF CS:IP
+       4. DEVICE INITIALIZATION SECTION
+           SIO$RESET$USART      RESET 8251A
+           SIO$INIT$MODE        INITIALIZE FOR LOAD/TRANSFER
+       5. PAPER TAPE, SERIAL, PARALLEL READ SECTION
+           SIO$READ$CHAR        READ CHAR FROM TTY READER
+           SIO$READ$BYTE        READ A BYTE
+           SIO$READ$WORD        READ A WORD
+           SIO$WRITE$HEX$FILE   OUTPUT HEX FILE
+           SIO$READ$HEX$FILE    INPUT HEX FILE
+       6. INTERRUPT AND RESTORE/EXECUTE ROUTINES
+           SAVE$REGISTERS       SAVES USER REGISTERS
+           RESTORE$EXECUTE      RESTORE MACHINE STATE AND EXEC
+           INTERRUPT1$ENTRY     INTERRUPT ROUTINE FOR SINGLE STEP
+           INTERRUPT3$ENTRY     INTERRUPT ROUTINE FOR GO
+           INTERRUPT32$ENTRY    INTERRUPT ROUTINE FOR 8259A
+           INIT$INT$VECTOR      INITIALIZES INTERRRUPT VECTORS
+ */
+
+    /************************
+    *   BASIC I/O SECTION   *
+    ************************/
+
+ SIO$CHAR$RDY:
+    /* TESTS FOR INPUT CHARACTER PENDING BY READING THE STATUS PORT
+       AND MASKING WITH SIO$RXRDY(READ DATA READY).  RETURNS TRUE IF
+       NOT EMPTY(CHAR PENDING) AND FALSE IF NO CHAR PENDING */
+    PROCEDURE BYTE;
+       IF (INPUT(SIO$STAT$PORT) AND SIO$RXRDY)=0 THEN RETURN FALSE;
+       RETURN TRUE;
+    END;
+
+ SIO$CHECK$CONTROL$CHAR:
+    /* THIS ROUTINE CHECKS IF A CONTROL CHARACTER HAS BEEN INPUT TO
+       THE SERIAL PORT.  AFTER A CONTROL-S IT WAITS FOR A CONTROL-Q BEFOR
+       RETURNING TO THE CALLER.  A CONTROL-C CAUSES A JUMP TO THE ERROR
+       ROUTINE. */
+    PROCEDURE;
+       CHAR = INPUT(SIO$DATA$PORT) AND 07FH;
+       IF CHAR=13H THEN               /* CONTROL-S ? */
+          DO WHILE CHAR<>11H;         /* CONTROL-Q   */
+             IF SIO$CHAR$RDY THEN
+                DO;
+                CHAR = INPUT(SIO$DATA$PORT) AND 07FH;
+                IF CHAR=03H THEN GOTO ERROR;
+                END;
+          END;
+       ELSE IF CHAR = 03H THEN GOTO ERROR;
+    END SIO$CHECK$CONTROL$CHAR;
+
+ SIO$OUT$CHAR:
+    /* THIS ROUTINE OUTPUTS THE INPUT PARAMETER TO THE USART OUTPUT
+       PORT WHEN USART IS READY FOR OUTPUT (XMIT BUFFER EMPTY). */
+    PROCEDURE(C);
+       DECLARE C BYTE;
+       IF (MODE AND SERIAL) <> 0 THEN
+          DO;
+ LOOP:    IF SIO$CHAR$RDY THEN CALL SIO$CHECK$CONTROL$CHAR;
+          IF (INPUT(SIO$STAT$PORT) AND SIO$TXRDY) = 0 THEN GOTO LOOP;
+          OUTPUT(SIO$DATA$PORT) = C;
+          END;
+       ELSE
+          DO;
+ LOOP1:   IF SIO$CHAR$RDY THEN CALL SIO$CHECK$CONTROL$CHAR;
+          IF (INPUT(PI$PORTC$STAT) AND PI$OBF) = 0 THEN GOTO LOOP1;
+          OUTPUT(PI$PORTA) = C;
+          END;
+       RETURN;
+    END;
+
+ SIO$GET$CHAR:
+    /* THIS ROUTINE INPUTS A CHARACTER FROM THE INPUT PORT AND RETURNS
+       WITH IT IN THE GLOBAL 'CHAR'. THE CHARACTER IS ECHOED TO THE
+       OUTPUT PORT IF PRINTABLE. */
+    PROCEDURE;
+       DO WHILE (INPUT(SIO$STAT$PORT) AND SIO$RXRDY)=0;END;
+       CHAR = INPUT(SIO$DATA$PORT) AND 07FH;
+       IF CHAR>=ASBL THEN CALL SIO$OUT$CHAR(CHAR);
+    END;
+
+ SIO$OUT$BYTE:
+    /* THIS ROUTINE OUTPUTS THE SINGLE INPUT PARAMETER TO THE USART
+       IN ASCII HEXADECIMAL FORMAT. */
+    PROCEDURE(B);
+       DECLARE B BYTE;
+       CALL SIO$OUT$CHAR(ASCII(SHR(B,4) AND 0FH));
+       CALL SIO$OUT$CHAR(ASCII(B AND 0FH));
+       CHECK$SUM = CHECK$SUM - B;
+    END;
+
+ SIO$OUT$BYTE$PTR:
+    /* THIS ROUTINE OUTPUTS THE BYTE BASED ON THE INPUT PARAMETER TO THE USART
+       IN ASCII HEXADECIMAL FORMAT. */
+    PROCEDURE (B$PTR);
+       DECLARE B$PTR POINTER, B BASED B$PTR BYTE, X BYTE;
+       X = B;
+       CALL SIO$OUT$BYTE(X);
+    END SIO$OUT$BYTE$PTR;
+
+ SIO$OUT$WORD:
+    /* THIS ROUTINE OUTPUTS THE INPUT PARAMETER AS 4 ASCII HEXADECIMAL
+       CHARACTERS TO THE USART OUTPUT PORT. */
+    PROCEDURE(W);
+       DECLARE W WORD;
+       CALL SIO$OUT$BYTE(HIGH(W));
+       CALL SIO$OUT$BYTE(LOW(W));
+    END;
+
+ SIO$OUT$BLANK:
+    /* THIS ROUTINE OUTPUTS ONE BLANK. */
+    PROCEDURE;
+       CALL SIO$OUT$CHAR(ASBL);
+    END;
+
+ SIO$OUT$STRING:
+    /* OUTPUTS A STRING POINTED TO BY THE FIRST PARM. */
+    PROCEDURE(PTR);
+       DECLARE PTR POINTER, STR BASED PTR (1) BYTE;
+       I = 0;
+       DO WHILE STR(I)<>0;
+          CALL SIO$OUT$CHAR(STR(I));
+          I = I + 1;
+       END;
+    END;
+
+ SIO$OUT$HEADER:
+    /* THIS ROUTINE OUTPUTS THE HEX FILE HEADER CONSISTING OF ':'
+       FOLLOWED BY THE RECORD LENGTH, LOAD ADDRESS, AND THE RECORD TYPE.
+       IT INITIALIZES THE CHECKSUM TO ZERO. */
+    PROCEDURE(LENGTH,LOAD$ADDR,REC$TYPE);
+       DECLARE (LENGTH,REC$TYPE) BYTE, LOAD$ADDR WORD;
+       CALL SIO$OUT$CHAR(':');
+       CHECK$SUM = 0;
+       CALL SIO$OUT$BYTE(LENGTH);
+       CALL SIO$OUT$WORD(LOAD$ADDR);
+       CALL SIO$OUT$BYTE(REC$TYPE);
+    END;
+
+
+     /*******************************
+     *   UTILITY ROUTINES SECTION   *
+     *******************************/
+
+ SIO$VALID$HEX:
+    /* THIS ROUTINE TESTS IF THE INPUT PARM IS A VALID ASCII HEX DIGIT
+       AND RETURNS TRUE AS THE VALUE OF THE PROCEDURE IF SO AND FALSE
+       IF NOT. */
+    PROCEDURE (H) BYTE;
+       DECLARE H BYTE;
+       DO I=0 TO LAST(ASCII);
+          IF H=ASCII(I) THEN RETURN TRUE;
+       END;
+       RETURN FALSE;
+    END;
+
+ SIO$HEX:
+   /* THIS ROUTINE CONVERTS THE INPUT PARM FROM ASCII TO ITS BINARY
+      EQUIVALENT AND RETURNS IT AS THE VALUE OF THE PROCEDURE. NO CHECK
+      IS MADE FOR INPUT VALIDITY. */
+   PROCEDURE(C) WORD;
+      DECLARE C BYTE;
+      IF C<='9' THEN RETURN DOUBLE(C-30H);
+      ELSE RETURN DOUBLE(C-37H);
+   END;
+
+ SIO$VALID$REG$FIRST:
+    /* THIS ROUTINE CHECKS IF 'CHAR' IS A VALID FIRST LETTER OF A REGISTER
+       NAME AND RETURNS TRUE AS THE VALUE OF THE PROCEDURE IF SO. */
+    PROCEDURE BYTE;
+       DO I=0 TO 26 BY 2;
+          IF CHAR=REG(I) THEN RETURN TRUE;
+       END;
+       RETURN FALSE;
+    END;
+
+ SIO$VALID$REG:
+    /* THIS ROUTINE CHECKS IF THE TWO INPUT PARMS TAKEN TOGETHER FORM
+       A VALID REGISTER NAME.  IT SEARCHES THE REGISTER TABLE AND IF A
+       MATCH IS FOUND, THE GLOBAL 'REG$INDEX' IS SET TO THE INDEX OF THE
+       VALID REGISTER AND THE PROCEDURE RETURNS TRUE.  IF NO MATCH THE
+       PROCEDURE RETURNS FALSE AND REG$INDEX IS UNDEFINED. */
+    PROCEDURE (C1,C2) BYTE;
+       DECLARE (C1,C2) BYTE;
+       DO REG$INDEX=0 TO 13;
+          IF C1=REG(REG$INDEX*2) AND C2=REG(REG$INDEX*2+1) THEN
+             RETURN TRUE;
+       END;
+       RETURN FALSE;
+    END;
+
+ SIO$CRLF:
+    /* THIS ROUTINE OUTPUTS A CR AND LF TO THE OUTPUT PORT. */
+    PROCEDURE;
+       CALL SIO$OUT$CHAR(ASCR);
+       CALL SIO$OUT$CHAR(ASLF);
+    END;
+
+ SIO$TEST$WORD$MODE:
+    /* THIS PROCEDURE TESTS FOR A 'W' FOLLOWING THE COMMAND AND IF SO
+       SETS THE FLAG 'WORD$MODE TO TRUE OR FALSE OTHERWISE. SCANS OFF
+       OPTIONAL BLANK FOLLOWING COMMAND. */
+    PROCEDURE;
+       WORD$MODE = FALSE;
+       CALL SIO$GET$CHAR;
+       IF CHAR='W' THEN
+          DO;
+          WORD$MODE = TRUE;
+          CALL SIO$GET$CHAR;
+          END;
+       IF CHAR=ASBL THEN
+          CALL SIO$GET$CHAR;
+    END;
+
+ SIO$SCAN$BLANK:
+    /* THIS ROUTINE IS CALLED AFTER A COMMAND LETTER TO SCAN OFF THE
+       OPTIONAL BLANK. */
+    PROCEDURE;
+       CALL SIO$GET$CHAR;
+       IF CHAR=ASBL THEN
+          CALL SIO$GET$CHAR;
+    END;
+
+
+ SIO$SECOND$DELAY:
+    /* THIS ROUTINE CAUSES A DELAY OF APPROXIMATELY 1 SECOND. */
+    PROCEDURE;
+       DECLARE II WORD;
+       DO II = 1 TO 0F000H; END;
+    END SIO$SECOND$DELAY;
+
+
+ SIO$MS$DELAY:
+    /* THIS ROUTINE CAUSES A DELAY OF 1 OR MORE MILLESECONDS; THE NUMBER
+       IS PASSED BY THE CALLER.  THE DELAY IS APPROXIMATE. */
+    PROCEDURE (N);
+       DECLARE (N,I,J) BYTE;
+       DO I = 1 TO N;
+          DO J = 1 TO 55; END;
+       END;
+    END SIO$MS$DELAY;
+
+
+    /********************************************
+    *   ARGUMENT EXPRESSION EVALUATOR SECTION   *
+    ********************************************/
+
+ SIO$GET$WORD:
+    /* THIS ROUTINE READS CHARS FROM THE INPUT PORT AND EVALUATES
+       AN EXPRESSION CONSISTING OF '+-' AND OPERANDS OF HEX NUMBERS
+       AND REGISTER NAMES. */
+    PROCEDURE WORD;
+       DECLARE (SAVE,W) WORD, (OPER,T) BYTE;
+       OPER = '+';
+       W = 0;
+       DO WHILE TRUE;
+          T = CHAR;
+          SAVE = 0;
+          IF SIO$VALID$REG$FIRST THEN
+             DO;
+             CALL SIO$GET$CHAR;
+             IF SIO$VALID$REG(T,CHAR) THEN
+                DO;
+                SAVE = REG$SAV(REG$INDEX);
+                CALL SIO$GET$CHAR;
+                GOTO EVAL;
+                END;
+             ELSE
+                SAVE = SIO$HEX(T);
+             END;
+          IF NOT(SIO$VALID$HEX(T)) THEN  GOTO ERROR;
+          DO WHILE SIO$VALID$HEX(CHAR);
+             SAVE = SHL(SAVE,4) + SIO$HEX(CHAR);
+             CALL SIO$GET$CHAR;
+          END;
+ EVAL:    IF OPER='+' THEN
+             W = W + SAVE;
+          ELSE
+             W = W - SAVE;
+          IF CHAR=ASCR OR CHAR=':' OR CHAR=',' THEN
+             RETURN W;
+          IF CHAR='+' OR CHAR='-' THEN
+             OPER = CHAR;
+          ELSE
+             GOTO ERROR;
+          CALL SIO$GET$CHAR;
+       END;
+    END;
+
+ SIO$GET$ADDR:
+    /* THIS ROUTINE ACCEPTS A VALID ADDRESS EXPRESSION CONSISTING
+       OF AN OPTIONAL <SEG>: AND AN DISPLACEMENT. */
+    PROCEDURE(PTR,DEFAULT$BASE);
+       DECLARE PTR POINTER, DEFAULT$BASE WORD,
+          ARG BASED PTR STRUCTURE (OFF WORD, SEG WORD);
+       ARG.SEG = DEFAULT$BASE;
+       ARG.OFF = SIO$GET$WORD;
+       IF CHAR=':' THEN
+          DO;
+          CALL SIO$GET$CHAR;
+          ARG.SEG = ARG.OFF;
+          ARG.OFF = SIO$GET$WORD;
+          IF CHAR=':' THEN  GOTO ERROR;
+          END;
+    END;
+
+ SIO$UPDATE$IP:
+    /* THIS PROCEDURE IS CALLED BY SINGLE STEP AND GO TO OUTPUT THE CURRENT
+       IP AND INSTRUCTION BYTE AND OPEN THE IP FOR INPUT. */
+    PROCEDURE;
+      CALL SIO$OUT$BLANK;
+      CALL SIO$OUT$WORD(IP);
+      CSIP.SEG = CS;
+      CSIP.OFF = IP;
+      CALL SIO$OUT$CHAR('-');
+      CALL SIO$OUT$BLANK;
+      CALL SIO$OUT$BYTE$PTR(MEMORY$CSIP$PTR);
+      CALL SIO$OUT$BLANK;
+      CALL SIO$GET$CHAR;
+      IF CHAR<>',' AND CHAR<>ASCR THEN CALL SIO$GET$ADDR(@CSIP,CS);
+    END;
+
+
+
+    /********************************************
+    *    DEVICE INITIALIZATION SECTION          *
+    ********************************************/
+
+
+ SIO$RESET$USART:
+      /* THIS PROCEDURE RESETS THE 8251A USART */
+      PROCEDURE;
+         OUTPUT(SIO$STAT$PORT) = 0H;
+         CHAR = 0;  /* DELAY */
+         OUTPUT(SIO$STAT$PORT) = 0H;
+         CHAR = 0;  /* DELAY */
+         OUTPUT(SIO$STAT$PORT) = 0H;
+         CHAR = 0;  /* DELAY */
+         OUTPUT(SIO$STAT$PORT) = SIO$RESET;
+      END SIO$RESET$USART;
+
+ SIO$INIT$MODE:
+    /* INITIALIZES THE INTERFACE FOR THE LOAD AND TRANSFER COMMANDS */
+    PROCEDURE;
+       MODE = SAVE$MODE;
+       IF MODE = PARALLEL THEN OUTPUT(PI$PORTC$CTL) = PI$M2M1;
+       ELSE
+          DO;
+          IF (MODE AND TAPE) = 0 THEN
+             IF BRF = B600 THEN
+                DO;
+                 /* MUST BE ON-LINE TO INTELLEC SERIES II WITH
+                    INTEGRATED CRT.  JACK-UP BAUD RATE. */
+                CALL SIO$MS$DELAY(200);
+                CALL SIO$RESET$USART;
+                OUTPUT(SIO$STAT$PORT) = SIO$CRT$MODE;
+                OUTPUT(IT$CONTROL$PORT) = IT$C2M3;
+                OUTPUT(SIO$STAT$PORT) = SIO$CRT$CMD;
+                OUTPUT(IT$CTR2$PORT) = LOW(B9600);
+                OUTPUT(IT$CTR2$PORT) = HIGH(B9600);
+                SWITCH$BAUD = TRUE;
+                END;
+          END;
+    END SIO$INIT$MODE;
+
+
+    /************************************************
+    *   PAPER TAPE, SERIAL, PARALLEL READ SECTION   *
+    ************************************************/
+
+ SIO$READ$CHAR:
+    /* THIS PROCEDURE READS A BYTE FROM THE TTY PAPER TAPE READER,
+       THE SERIAL INTERFACE TO AN INTELLEC, OR THE PARALLEL
+       INTERFACE TO AN INTELLEC, DEPENDING UPON THE SETTING OF
+       MODE. */
+    PROCEDURE BYTE;
+       DECLARE II WORD;
+       IF (MODE AND TAPE) <> 0 THEN
+          DO;
+          DO WHILE (INPUT(SIO$STAT$PORT) AND SIO$TXE) = 0; END;
+          OUTPUT(SIO$STAT$PORT) = SIO$DTR$ON;         /* DTR ON */
+          CALL SIO$MS$DELAY(40);
+          OUTPUT(SIO$STAT$PORT) = SIO$DTR$OFF;
+          DO II = 1 TO MAX$DELAY;
+             IF (INPUT(SIO$STAT$PORT) AND SIO$RXRDY) <> 0 THEN GOTO READY2;
+          END;
+          GOTO ERROR;
+ READY2:
+          DO WHILE (INPUT(SIO$STAT$PORT) AND SIO$RXRDY)=0; END;
+          CHAR = INPUT(SIO$DATA$PORT) AND 7FH;
+          END;
+       ELSE IF (MODE AND SERIAL) <> 0 THEN
+          DO;
+ LOOP:    DO II = 1 TO MAX$DELAY;
+             IF SIO$CHAR$RDY THEN GOTO READY;
+          END;
+          GOTO ERROR;
+ READY:   CALL SIO$CHECK$CONTROL$CHAR;
+          IF CHAR = 11H THEN GOTO LOOP; /* GET ANOTHER IF CTL-Q */
+          END;
+       ELSE
+          DO;
+          DO II = 1 TO MAX$DELAY;
+             IF SIO$CHAR$RDY THEN CALL SIO$CHECK$CONTROL$CHAR;
+             IF (INPUT(PI$PORTC$STAT) AND PI$IBF) <> 0 THEN GOTO READY1;
+          END;
+          GOTO ERROR;
+ READY1:  CHAR = NOT INPUT(PI$PORTB);
+          END;
+       RETURN CHAR;
+   END SIO$READ$CHAR;
+
+ SIO$READ$BYTE:
+    /* THIS ROUTINE READS TWO HEX BYTES AND RETURNS THEIR BINARY
+       BYTE VALUE. */
+    PROCEDURE BYTE;
+       DECLARE T BYTE;
+       T = LOW(SIO$HEX(SIO$READ$CHAR));
+       T = SHL(T,4) + LOW(SIO$HEX(SIO$READ$CHAR));
+       CHECK$SUM = CHECK$SUM + T;
+       RETURN T;
+    END;
+
+ SIO$READ$WORD:
+    /* THIS ROUTINE READS FOUR HEX BYTES AND RETURNS THEIR BINARY
+       WORD VALUE. */
+    PROCEDURE WORD;
+       DECLARE T BYTE;
+       T = SIO$READ$BYTE;
+       RETURN SHL(DOUBLE(T),8) + DOUBLE(SIO$READ$BYTE);
+   END;
+
+ SIO$WRITE$HEX$FILE:
+    /* THIS ROUTINE IS CALLED BY THE WRITE AND TRANSFER COMMANDS TO
+       COMPLETE DECODING THE COMMAND LINE AND OUTPUT A HEX FILE.
+       IT OUTPUTS LEADING NULLS, START ADDRESS RECORD (8086 ONLY),
+       EXTENDED ADDRESS RECORDS (8086 ONLY), DATA RECORDS, EOF RECORD,
+       AND TRAILING NULLS. */
+    PROCEDURE;
+       DECLARE (LEN,INDEX) WORD, START$REC BYTE;
+       DECLARE (FIRST,LAST) STRUCTURE (OFF WORD, SEG WORD);
+       CALL SIO$GET$ADDR(@ARG1,CS);
+       FIRST.SEG = ARG1.SEG AND 0F000H;
+       FIRST.OFF = ARG1.OFF + SHL(ARG1.SEG,4);
+       IF CARRY THEN
+          DO;
+          FIRST.SEG = FIRST.SEG + 1000H;
+          IF CARRY THEN GOTO ERROR;
+          END;
+       IF CHAR<>',' THEN GOTO ERROR;
+       CALL SIO$GET$CHAR;
+       IF MODE$8086 THEN
+          DO;
+          CALL SIO$GET$ADDR(@ARG2,ARG1.SEG);
+          LAST.SEG = ARG2.SEG AND 0F000H;
+          LAST.OFF = ARG2.OFF + SHL(ARG2.SEG,4);
+          IF CARRY THEN
+             DO;
+             LAST.SEG = LAST.SEG + 1000H;
+             IF CARRY THEN GOTO ERROR;
+             END;
+          /* CHECK IF END > START */
+          IF LAST.SEG < FIRST.SEG THEN GOTO ERROR;
+          IF LAST.SEG = FIRST.SEG THEN
+             IF LAST.OFF < FIRST.OFF THEN GOTO ERROR;
+          /* CONVERT END ADDRESS FOR USE IN LOOPING */
+          LAST.SEG = ARG2.SEG + SHR(ARG2.OFF,4) - ARG1.SEG;
+          LAST.OFF = SHL(LAST.SEG,4) + (ARG2.OFF AND 0FH);
+          LAST.SEG = (LAST.SEG AND 0F000H) + ARG1.SEG;
+          END;
+       ELSE DO;
+          END$OFF = SIO$GET$WORD;
+          IF END$OFF<ARG1.OFF THEN GOTO ERROR;
+          LAST.SEG = ARG1.SEG;
+          LAST.OFF = END$OFF;
+          END;
+       IF CHAR <> ASCR THEN
+          DO;
+          START$REC = TRUE;
+          CALL SIO$GET$CHAR;
+          IF MODE$8086 THEN CALL SIO$GET$ADDR(@ARG3,CS);
+          ELSE ARG3.OFF = SIO$GET$WORD;
+          END;
+       ELSE
+          DO;
+          START$REC = FALSE;
+          ARG3.OFF = 0;
+          END;
+       IF CHAR<>ASCR THEN GOTO ERROR;
+       CALL SIO$CRLF;
+       CALL SIO$INIT$MODE;
+       CALL SIO$SECOND$DELAY;
+
+       DO I=1 TO 60;             /* LEADING NULLS */
+          CALL SIO$OUT$CHAR(0);
+       END;
+       CALL SIO$CRLF;
+
+       IF MODE$8086 THEN
+          DO;
+          IF START$REC THEN
+             DO;
+             CALL SIO$OUT$HEADER(04,0,03); /* START ADDRESS RECORD */
+             CALL SIO$OUT$WORD(ARG3.SEG);
+             CALL SIO$OUT$WORD(ARG3.OFF);
+             CALL SIO$OUT$BYTE(CHECK$SUM);
+             CALL SIO$CRLF;
+             ARG3.OFF = 0;
+             END;
+          END;
+
+ LOOP1:
+       IF MODE$8086 THEN DO;
+          CALL SIO$OUT$HEADER(02,0,02); /* EXTENDED ADDRESS RECORD */
+          CALL SIO$OUT$WORD(ARG1.SEG);
+          CALL SIO$OUT$BYTE(CHECK$SUM);
+          CALL SIO$CRLF;
+          END;
+       IF LAST.SEG = ARG1.SEG THEN END$OFF = LAST.OFF;
+       ELSE END$OFF = 0FFFFH;
+       LEN = STANDARD$LEN;             /* DATA RECORD */
+ LOOP: INDEX = END$OFF - ARG1.OFF;
+       IF INDEX<STANDARD$LEN-1 THEN LEN = INDEX+1;
+       CALL SIO$OUT$HEADER(LEN,ARG1.OFF,00);
+       DO I=1 TO LEN;
+          CALL SIO$OUT$BYTE$PTR(MEMORY$ARG1$PTR);
+          ARG1.OFF = ARG1.OFF + 1;
+       END;
+       CALL SIO$OUT$BYTE(CHECK$SUM);
+       CALL SIO$CRLF;
+       IF END$OFF <> ARG1.OFF-1 THEN GOTO LOOP;
+       IF LAST.SEG <> ARG1.SEG THEN
+          DO;
+          ARG1.SEG = ARG1.SEG + 1000H;
+          ARG1.OFF = 0;
+          GOTO LOOP1;
+          END;
+
+       CALL SIO$OUT$HEADER(00,ARG3.OFF,01);     /* EOF RECORD */
+       CALL SIO$OUT$BYTE(CHECK$SUM);
+       CALL SIO$CRLF;
+
+       DO I=1 TO 60;           /* TRAILING NULLS */
+          CALL SIO$OUT$CHAR(0);
+       END;
+       MODE = SERIAL;
+    END;
+
+
+ SIO$READ$HEX$FILE:
+    /* THIS ROUTINE IS CALLED BY THE READ AND LOAD COMMANDS TO
+       COMPLETE DECODING THE COMMAND LINE AND READ A HEX FILE. */
+    PROCEDURE;
+       DECLARE (REC$TYPE,LEN,I,T) BYTE, OFFSET WORD;
+       IF CHAR <> ASCR THEN CALL SIO$GET$ADDR(@ARG2,0);  /* GET BIAS ADDR */
+       ELSE ARG2.SEG,ARG2.OFF = 0;
+       ARG1.SEG = ARG2.SEG;  /* SEGMENT FOR 8080 FORMAT FILE */
+       IF CHAR<>ASCR THEN GOTO ERROR;
+       CALL SIO$CRLF;
+       CALL SIO$INIT$MODE;
+ LOOP:
+       DO WHILE SIO$READ$CHAR<>':';END;
+       CHECK$SUM = 0;
+       LEN = SIO$READ$BYTE;
+       OFFSET = SIO$READ$WORD;
+       ARG1.OFF = OFFSET + ARG2.OFF;
+       REC$TYPE = SIO$READ$BYTE;
+       IF REC$TYPE=03 THEN       /* START ADDR TYPE */
+          DO;
+          CS = SIO$READ$WORD;
+          IP = SIO$READ$WORD;
+          END;
+       IF REC$TYPE=02 THEN       /* EXTENDED ADDR TYPE */
+          ARG1.SEG = SIO$READ$WORD + ARG2.SEG;
+       IF REC$TYPE=01 THEN IF OFFSET <> 0 THEN IP = OFFSET;   /* EOF RECORD */
+       IF REC$TYPE=00 THEN       /* DATA TYPE */
+          DO I=1 TO LEN;
+             T,MEMORY$ARG1 = SIO$READ$BYTE;
+             IF MEMORY$ARG1<>T THEN GOTO ERROR;
+             ARG1.OFF = ARG1.OFF + 1;
+          END;
+       T = SIO$READ$BYTE;        /* FETCH CHECKSUM */
+       IF CHECK$SUM<>0 THEN GOTO ERROR;
+       IF REC$TYPE<>01 AND LEN<>0 THEN GOTO LOOP;   /* EOF */
+       MODE = SERIAL;
+       CALL SIO$OUT$CHAR(0);  /* DELAY FOR LAST CR, LF SENT */
+       CALL SIO$OUT$CHAR(0);  /*      BY INTELLEC */
+    END;
+
+
+
+
+    /********************************************
+    *   INTERRUPT AND RESTORE/EXECUTE SECTION   *
+    ********************************************/
+
+ SAVE$REGISTERS:
+    /* THIS ROUTINE IS USED TO SAVE THE STACKED USER'S REGISTERS IN THE
+       MONITOR'S SAVE AREA. */
+    PROCEDURE;
+       BP = MEMORY$USERSTACK;
+       USERSTACK.OFF = USERSTACK.OFF + 4;
+       DO I=0 TO 10;                      /* POP REGISTERS OFF OF STACK */
+          REG$SAV(REG$ORD(I)) = MEMORY$USERSTACK;
+          USERSTACK.OFF = USERSTACK.OFF + 2;
+       END;
+       SS = USERSTACK.SEG;
+       SP = USERSTACK.OFF;
+    END;
+
+ RESTORE$EXECUTE:
+    /* THIS PROCEDURE RESTORES THE STATE OF THE USER MACHINE AND
+       PASSES CONTROL BACK TO THE USER PROGRAM. IT CONTAINS A
+       MACHINE LANGUAGE SUBROUTINE TO PERFORM THE POPPING OF THE
+       USER REGISTERS AND TO EXECUTE AN 'IRET' TO TRANSFER CONTROL
+       TO THE USER'S PROGRAM. */
+    PROCEDURE;
+       DECLARE RESTORE$EXECUTE$CODE(*) BYTE DATA
+          (08BH,0ECH,           /* MOV BP,SP           */
+           08BH,046H,002H,      /* MOV AX,/BP/.PARM2   */
+           08BH,05EH,004H,      /* MOV BX,/BP/.PARM1   */
+           08EH,0D0H,           /* MOV SS,AX           */
+           08BH,0E3H,           /* MOV SP,BX           */
+           05DH,                /* POP BP              */
+           05FH,                /* POP DI              */
+           05EH,                /* POP SI              */
+           05BH,                /* POP BX              */
+           05AH,                /* POP DX              */
+           059H,                /* POP CX              */
+           058H,                /* POP AX              */
+           01FH,                /* POP DS              */
+           007H,                /* POP ES              */
+           0CFH),               /* IRET                */
+          RESTORE$EXECUTE$CODE$PTR WORD DATA (.RESTORE$EXECUTE$CODE);
+
+       USERSTACK.SEG = SS;
+       USERSTACK.OFF = SP;
+       DO I=0 TO 10;           /* PUSH USER'S REGISTERS ONTO HIS STACK */
+          USERSTACK.OFF = USERSTACK.OFF - 2;
+          MEMORY$USERSTACK = REG$SAV(REG$ORD(10-I));
+       END;
+       USERSTACK.OFF = USERSTACK.OFF - 2;
+       MEMORY$USERSTACK = BP;
+       CALL RESTORE$EXECUTE$CODE$PTR(USERSTACK.OFF,USERSTACK.SEG);
+    END;
+
+ INTERRUPT1$ENTRY:
+    /* THIS PROCEDURE IS CALLED WHEN THE CPU IS INTERRUPTED BY EXECUTING
+       AN INSTRUCTION WITH THE TRAP BIT SET (SINGLE STEP). */
+    PROCEDURE INTERRUPT 1;
+       USERSTACK.OFF = STACKPTR;         /* CHANGE TO MONITOR'S STACK */
+       USERSTACK.SEG = STACKBASE;
+       STACKPTR =  MONITOR$STACKPTR;
+       STACKBASE = MONITOR$STACKBASE;
+       CALL SAVE$REGISTERS;
+       FL = FL AND (NOT STEP$TRAP);     /* CLEAR STEP FLAG */
+       IF LAST$COMMAND<>SS$COMMAND THEN  /* CONTINUE IF NOT SS */
+          CALL RESTORE$EXECUTE;
+       CSIP.OFF = IP;
+       CSIP.SEG = CS;
+       IF MEMORY$CSIP$PTR = INT3$PTR THEN
+          CALL RESTORE$EXECUTE;  /* EXIT TO PROCESS INT 3 */
+       CALL SIO$CRLF;
+       CALL SIO$UPDATE$IP;
+       IF CHAR=',' THEN
+          DO;
+          IP = CSIP.OFF;
+          CS = CSIP.SEG;
+          FL = FL OR STEP$TRAP;         /* SET STEP FLAG */
+          CALL RESTORE$EXECUTE;
+          END;
+       IF CHAR<>ASCR THEN  GOTO ERROR;
+       GOTO NEXT$COMMAND;
+    END;
+
+ INTERRUPT3$ENTRY:
+    /* THIS PROCEDURE IS CALLED WHEN THE CPU EXECUTES A 'INT 3' INSTRUCTION.
+       THE MONITOR INSERTS THIS (0CCH) FOR A BREAKPOINT.  ALSO A NMI
+       INTERRUPT OR A USER SOFTWARE INTERRUPT MAY CAUSE THIS PROCEDURE TO BE
+       CALLED. */
+    PROCEDURE INTERRUPT 3;
+       USERSTACK.OFF = STACKPTR;
+       USERSTACK.SEG = STACKBASE;
+       STACKPTR =  MONITOR$STACKPTR;
+       STACKBASE = MONITOR$STACKBASE;
+       CALL SAVE$REGISTERS;
+       CALL SIO$CRLF;
+       GOTO AFTER$INTERRUPT;
+    END;
+
+ INTERRUPT32$ENTRY:
+    /* THIS ROUTINE IS EXECUTED WHEN THE CPU RECEIVES AN INTERRUPT FROM
+       THE 8259A. */    PROCEDURE INTERRUPT 32;
+       USERSTACK.OFF = STACKPTR;
+       USERSTACK.SEG = STACKBASE;
+       STACKPTR =  MONITOR$STACKPTR;
+       STACKBASE = MONITOR$STACKBASE;
+       CALL SAVE$REGISTERS;
+       CALL SIO$CRLF;
+       CALL SIO$OUT$CHAR('I');
+       CALL SIO$OUT$CHAR('=');
+       OUTPUT(IC$PORTA) = IC$OCW3;
+       CHAR = INPUT(IC$PORTA);
+       J = 1;
+       DO I = 0 TO 7;
+          IF (CHAR AND J) <> 0 THEN GOTO L1;
+          J = SHL(J,1);
+       END;
+ L1:   CALL SIO$OUT$BYTE(I);
+       CALL SIO$OUT$BLANK;
+       OUTPUT(IC$PORTA) = IC$EOI;
+       GOTO AFTER$INTERRUPT;
+    END INTERRUPT$32$ENTRY;
+
+ INIT$INT$VECTOR:
+    /* THIS ROUTINE INITIALIZES AN INTERRRUPT VECTOR AS FOLLOWS: THE OFFSET
+       FROM THE ADDRESS OF 'INT$ROUTINE' CORRECTED BY THE APPROPRIATE
+       NUMBER OF BYTES FOR THE INTERRUPT PLM PROLOGUE. THE SEGMENT FROM THE
+       CURRENT CS REGISTER IS DETERMINED BY A MACHINE LANGUAGE CODED
+       SUBROUTINE. */
+    PROCEDURE(INT$VECTOR$PTR,INT$ROUTINE$OFFSET);
+       DECLARE INT$VECTOR$PTR POINTER, INT$ROUTINE$OFFSET WORD,
+          VECTOR BASED INT$VECTOR$PTR STRUCTURE (OFF WORD, SEG WORD),
+          CORRECTION LITERALLY '19H',  /* OFFSET FOR PROLOGUE */
+          INIT$INT$VECTOR$CODE(*) BYTE DATA
+          (055H,                           /* PUSH BP            */
+           08BH,0ECH,                      /* MOV BP,SP          */
+           08CH,0C8H,                      /* MOV AX,CS          */
+           0C4H,05EH,004H,                 /* LES BX,/BP/.PARM1  */
+           026H,089H,007H,                 /* MOV ES:W/BX/,AX    */
+           05DH,                           /* POP BP             */
+           0C2H,004H,000H),                /* RET 4              */
+          INIT$INT$VECTOR$CODE$PTR WORD DATA (.INIT$INT$VECTOR$CODE);
+
+          CALL INIT$INT$VECTOR$CODE$PTR(@VECTOR.SEG);    /* SEGMENT PORTION */
+          VECTOR.OFF = INT$ROUTINE$OFFSET - CORRECTION;   /* OFFSET PORTION */
+    END;
+
+
+ /* *****************************************************************
+    *****************************************************************
+
+                       COMMAND MODULE
+                       ==============
+    ABSTRACT
+    ========
+    THIS MODULE CONTAINS ALL THE COMMANDS IMPLEMENTED AS INDIVIDUAL PROCEDURES
+    AND CALLED FROM THE OUTER BLOCK OF THE COMMAND DISPATCH LOOP.
+
+    MODULE ORGANIZATION
+    ===================
+    THIS MODULE CONTAINS THE FOLLOWING SECTIONS:
+
+       1. COMMANDS SECTION
+           SIO$GO               GO
+           SIO$SINGLE$STEP      SINGLE STEP
+           SIO$EXAM$MEM         SUBSTITUTE MEMORY
+           SIO$EXAM$REG         EXAMINE REGISTER
+           SIO$MOVE             MOVE
+           SIO$DISPLAY          DISPLAY BYTES
+           SIO$COMPARE          COMPARE MEMORY
+           SIO$FIND             FIND BYTE/WORD
+           SIO$HEX$ARITH        PERFORM HEX ARITHMETIC
+           SIO$INPUT            INPUT PORT
+           SIO$OUTPUT           OUTPUT PORT
+           SIO$WRITE            WRITE DATA RECORDS
+           SIO$READ             READ DATA RECORDS
+           SIO$TRANSFER         TRANSFER FILE
+           SIO$LOAD             LOAD FILE
+      2. COMMAND DISPATCH (OUTER BLOCK, MAIN PROGRAM LOOP)
+           NEXT$COMMAND         DISPATCH
+           ERROR                ERROR ROUTINE
+ */
+
+    /**********************
+    *   COMMAND SECTION   *
+    **********************/
+
+
+ SIO$GO:
+    /* IMPLEMENTS THE 'GO' COMMAND. THE USER MAY SPECIFY A NEW
+       IP:PC AND AN OPTIONAL BREAKPOINT. */
+    PROCEDURE;
+       CALL SIO$UPDATE$IP;
+       IF CHAR=',' THEN              /* BREAKPOINT */
+          DO;
+          CALL SIO$GET$CHAR;
+          CALL SIO$GET$ADDR(@BRK1,CSIP.SEG);
+          IF (CHAR<>ASCR) AND (CHAR<>',') THEN  GOTO ERROR;
+          BRK1$SAVE = MEMORY$BRK1;
+          MEMORY$BRK1 = BREAK$INST;
+          IF MEMORY$BRK1<>BREAK$INST THEN GOTO ERROR;
+          BRK1$FLAG = TRUE;
+          IF CHAR = ',' THEN
+             DO;
+             CALL SIO$GET$CHAR;
+             CALL SIO$GET$ADDR(@BRK2,CSIP.SEG);
+             IF CHAR <> ASCR THEN GOTO ERROR;
+             BRK2$SAVE = MEMORY$BRK2;
+             MEMORY$BRK2 = BREAK$INST;
+             IF MEMORY$BRK2 <> BREAK$INST THEN GOTO ERROR;
+             BRK2$FLAG = TRUE;
+             END;
+          END;
+       ELSE                          /* NO BREAKPOINT */
+          IF CHAR<>ASCR THEN  GOTO ERROR;
+       CALL SIO$CRLF;
+       IP = CSIP.OFF;
+       CS = CSIP.SEG;
+       FL = FL AND (NOT STEP$TRAP);      /* CLEAR IF SET */
+       CALL RESTORE$EXECUTE;
+    END;
+
+ SIO$SINGLE$STEP:
+    /* IMPLEMENTS THE SINGLE STEP COMMAND. DISPLAYS IP AND THE
+       CURRENT INSTRUCTION BYTE. OPENS CS:IP FOR INPUT. DEPRESSING
+       COMMA CAUSES THE MONITOR TO SINGLE STEP THE INSTRUCTION, AND
+       PERIOD TERMINATES THE COMMAND. */
+    PROCEDURE;
+       CALL SIO$UPDATE$IP;
+       IF CHAR<>',' THEN GOTO ERROR;
+       IP = CSIP.OFF;
+       CS = CSIP.SEG;
+       FL = FL OR STEP$TRAP;
+       CALL RESTORE$EXECUTE;
+    END;
+
+
+
+ SIO$EXAM$MEM:
+    /* IMPLEMENTS THE EXAMINE MEMORY COMMAND. */
+    PROCEDURE;
+       DECLARE W WORD;
+       CALL SIO$TEST$WORD$MODE;
+       CALL SIO$GET$ADDR(@ARG1,CS);
+       IF CHAR<>',' THEN  GOTO ERROR;
+       DO WHILE TRUE;
+          CALL SIO$OUT$BLANK;
+          IF WORD$MODE THEN
+             CALL SIO$OUT$WORD(MEMORY$WORD$ARG1);
+          ELSE
+             CALL SIO$OUT$BYTE$PTR(MEMORY$ARG1$PTR);
+          CALL SIO$OUT$CHAR('-');
+          CALL SIO$OUT$BLANK;
+          CALL SIO$GET$CHAR;
+          IF CHAR=ASCR THEN RETURN;
+          IF CHAR<>',' THEN
+             DO;
+             W = SIO$GET$WORD;
+             IF (CHAR <> ',') AND (CHAR <> ASCR) THEN GOTO ERROR;
+             IF WORD$MODE THEN
+                DO;
+                MEMORY$WORD$ARG1 = W;
+                IF MEMORY$WORD$ARG1<>W THEN GOTO ERROR;
+                END;
+             ELSE
+                DO;
+                MEMORY$ARG1 = LOW(W);
+                IF MEMORY$ARG1<>LOW(W) THEN GOTO ERROR;
+                END;
+             END;
+          IF CHAR=ASCR THEN RETURN;
+          IF WORD$MODE THEN
+             ARG1.OFF = ARG1.OFF + 2;
+          ELSE
+             ARG1.OFF = ARG1.OFF + 1;
+          CALL SIO$CRLF;
+          CALL SIO$OUT$WORD(ARG1.OFF);
+       END;
+    END;
+
+ SIO$EXAM$REG:
+    /* IMPLEMENTS THE EXAMINE REGISTER COMMAND. SCANS FOR A VALID
+       REGISTER NAME AND DISPLAYS THE VALUE OF THAT REGISTER WHICH IS
+       OPTIONALLY OPENED FOR INPUT. COMMA INCREMENTS TO NEXT REGISTER
+       UNLESS IT IS 'FL' WHICH TERMINATES AS DOES CR. */
+    PROCEDURE;
+       DECLARE (T,I) BYTE;
+       DECLARE SAVE WORD;
+       CALL SIO$SCAN$BLANK;
+       IF CHAR=ASCR THEN
+          DO;
+          CALL SIO$CRLF;
+          DO I=0 TO 13;
+             CALL SIO$OUT$BLANK;
+             CALL SIO$OUT$CHAR(REG(I*2));
+             CALL SIO$OUT$CHAR(REG(I*2+1));
+             CALL SIO$OUT$CHAR('=');
+             CALL SIO$OUT$WORD(REG$SAV(I));
+             IF I=6 THEN CALL SIO$CRLF;
+          END;
+          RETURN;
+          END;
+       IF NOT(SIO$VALID$REG$FIRST) THEN  GOTO ERROR;
+       T = CHAR;
+       CALL SIO$GET$CHAR;
+       IF NOT(SIO$VALID$REG(T,CHAR)) THEN  GOTO ERROR;
+       I = REG$INDEX;
+       DO WHILE TRUE;
+          CALL SIO$OUT$CHAR('=');
+          CALL SIO$OUT$WORD(REG$SAV(I));
+          CALL SIO$OUT$CHAR('-');
+          CALL SIO$OUT$BLANK;
+          CALL SIO$GET$CHAR;
+          IF CHAR<>',' AND CHAR<>ASCR THEN
+             DO;
+             SAVE = SIO$GET$WORD;
+             IF (CHAR <> ',' ) AND (CHAR <> ASCR) THEN GOTO ERROR;
+             REG$SAV(I) = SAVE;
+             END;
+          IF CHAR=ASCR OR I=13 THEN RETURN;
+          I = I + 1;
+          CALL SIO$CRLF;
+          CALL SIO$OUT$CHAR(REG(I*2));
+          CALL SIO$OUT$CHAR(REG(I*2+1));
+       END;
+    END;
+
+ SIO$MOVE:
+    /* IMPLEMENTS THE MOVE COMMAND. ACCEPTS 3 ARGUMENTS AMD MOVES THE
+       BLOCK OF MEMORY SPECIFIED BY ARG1-ARG2 TO ARG3. ARG2<ARG1 OR THERE
+       IS A DIFFERENCE WHEN THE BYTE IS READ BACK, THEN ERROR. */
+    PROCEDURE;
+       CALL SIO$SCAN$BLANK;
+       CALL SIO$GET$ADDR(@ARG1,CS);           /* FIRST ARGUMENT */
+       IF CHAR<>',' THEN GOTO ERROR;
+       CALL SIO$GET$CHAR;
+       END$OFF = SIO$GET$WORD;                /* SECOND ARGUMENT */
+       IF END$OFF<ARG1.OFF THEN  GOTO ERROR;
+       IF CHAR<>',' THEN  GOTO ERROR;
+       CALL SIO$GET$CHAR;
+       CALL SIO$GET$ADDR(@ARG3,CS);     /* THIRD ARGUMENT */
+       IF CHAR<>ASCR THEN GOTO ERROR;
+       CALL SIO$CRLF;
+ LOOP:
+       MEMORY$ARG3 = MEMORY$ARG1;
+       IF MEMORY$ARG3<>MEMORY$ARG1 THEN GOTO ERROR;
+       IF ARG1.OFF = END$OFF THEN RETURN;
+       ARG1.OFF = ARG1.OFF + 1;
+       ARG3.OFF = ARG3.OFF + 1;
+       GOTO LOOP;
+    END;
+
+ SIO$DISPLAY:
+    /* IMPLEMENTS THE DISPLAY BYTE COMMAND. IF CALLED WITH 1 PARM THEN
+        OUTPUTS A SINGLE BYTE. IF CALLED WITH 2 PARMS THEN OUTPUTS THE RANGE
+        BETWEEN THE TWO ADDRESSES. IF OFFSET<BEGIN THEN OUTPUTS ONLY A SINGLE
+        BYTE. */
+    PROCEDURE;
+       DECLARE T BYTE;
+       CALL SIO$TEST$WORD$MODE;
+       CALL SIO$GET$ADDR(@ARG1,CS);
+       IF CHAR=ASCR THEN
+          END$OFF = ARG1.OFF;
+       ELSE
+          DO;
+          IF CHAR<>',' THEN GOTO ERROR;
+          CALL SIO$GET$CHAR;
+          END$OFF = SIO$GET$WORD;
+          IF END$OFF < ARG1.OFF THEN GOTO ERROR;
+          IF CHAR<>ASCR THEN  GOTO ERROR;
+          END;
+ NEWLINE:
+       CALL SIO$CRLF;
+       CALL SIO$OUT$WORD(ARG1.OFF);
+ LOOP: CALL SIO$OUT$BLANK;
+       IF WORD$MODE THEN
+          DO;
+          CALL SIO$OUT$WORD(MEMORY$WORD$ARG1);
+          IF ARG1.OFF = END$OFF THEN RETURN;
+          ARG1.OFF = ARG1.OFF + 1;
+          END;
+       ELSE
+          CALL SIO$OUT$BYTE$PTR(MEMORY$ARG1$PTR);
+       IF ARG1.OFF>=END$OFF THEN RETURN;
+       ARG1.OFF = ARG1.OFF + 1;
+       T = ARG1.OFF AND 000FH;
+       IF T=0 OR (WORD$MODE AND T=1) THEN GOTO NEWLINE;
+       GOTO LOOP;
+       END;
+
+ SIO$COMPARE:
+    /* IMPLEMENTS THE COMPARE COMMAND */
+    PROCEDURE;
+       CALL SIO$SCAN$BLANK;
+       CALL SIO$GET$ADDR(@ARG1,CS);
+       IF CHAR <> ',' THEN GOTO ERROR;
+       CALL SIO$GET$CHAR;
+       END$OFF = SIO$GET$WORD;
+       IF END$OFF < ARG1.OFF THEN GOTO ERROR;
+       IF CHAR <> ',' THEN GOTO ERROR;
+       CALL SIO$GET$CHAR;
+       CALL SIO$GET$ADDR(@ARG3,CS);
+       IF CHAR <> ASCR THEN GOTO ERROR;
+       CALL SIO$CRLF;
+ LOOP:
+       IF MEMORY$ARG1 <> MEMORY$ARG3 THEN
+          DO;
+          CALL SIO$OUT$WORD(ARG1.OFF);
+          CALL SIO$OUT$BLANK;
+          CALL SIO$OUT$BYTE$PTR(MEMORY$ARG1$PTR);
+          CALL SIO$OUT$BLANK;
+          CALL SIO$OUT$WORD(ARG3.OFF);
+          CALL SIO$OUT$BLANK;
+          CALL SIO$OUT$BYTE$PTR(MEMORY$ARG3$PTR);
+          CALL SIO$CRLF;
+          END;
+       IF ARG1.OFF = END$OFF THEN RETURN;
+       ARG1.OFF = ARG1.OFF + 1;
+       ARG3.OFF = ARG3.OFF + 1;
+       GOTO LOOP;
+    END SIO$COMPARE;
+
+ SIO$FIND:
+    /* IMPLEMENTS THE FIND COMMAND */
+    PROCEDURE;
+       DECLARE SEARCH$WORD WORD;
+       CALL SIO$TEST$WORD$MODE;
+       CALL SIO$GET$ADDR(@ARG1,CS);
+       IF CHAR <>  ',' THEN GOTO ERROR;
+       CALL SIO$GET$CHAR;
+       END$OFF = SIO$GET$WORD;
+       IF END$OFF < ARG1.OFF THEN GOTO ERROR;
+       CALL SIO$GET$CHAR;
+       SEARCH$WORD = SIO$GET$WORD;
+       IF CHAR <> ASCR THEN GOTO ERROR;
+       CALL SIO$CRLF;
+ LOOP:
+      IF WORD$MODE THEN
+         DO;
+         IF MEMORY$WORD$ARG1 = SEARCH$WORD THEN
+            DO;
+            CALL SIO$OUT$WORD(ARG1.OFF);
+            CALL SIO$CRLF;
+            END;
+         END;
+      ELSE
+         DO;
+         IF MEMORY$ARG1 = LOW(SEARCH$WORD) THEN
+            DO;
+            CALL SIO$OUT$WORD(ARG1.OFF);
+            CALL SIO$CRLF;
+            END;
+         END;
+      IF ARG1.OFF = END$OFF THEN RETURN;
+      ARG1.OFF = ARG1.OFF + 1;
+      GOTO LOOP;
+    END SIO$FIND;
+
+ SIO$HEX$ARITH:
+    /* IMPLEMENTS THE HEX ARITHMETIC COMMAND */
+    PROCEDURE;
+       DECLARE (W1,W2) WORD;
+       CALL SIO$SCAN$BLANK;
+       W1 = SIO$GET$WORD;
+       IF CHAR <> ',' THEN GOTO ERROR;
+       CALL SIO$GET$CHAR;
+       W2 = SIO$GET$WORD;
+       IF CHAR <> ASCR THEN GOTO ERROR;
+       CALL SIO$CRLF;
+       CALL SIO$OUT$WORD(W1+W2);
+       CALL SIO$OUT$BLANK;
+       CALL SIO$OUT$WORD(W1-W2);
+ END SIO$HEX$ARITH;
+
+ SIO$INPUT:
+    /* THIS ROUTINE IMPLEMENTS THE 'INPUT' COMMAND. USER SPECIFIES
+       A PORT AND THE DATUM OF THE PORT IS DISPLAYED. */
+   PROCEDURE;
+      DECLARE PORT WORD;
+      CALL SIO$TEST$WORD$MODE;
+      PORT = SIO$GET$WORD;
+ LOOP:
+      IF CHAR<>',' THEN GOTO ERROR;
+      CALL SIO$CRLF;
+      IF WORD$MODE THEN
+         CALL SIO$OUT$WORD(INWORD(PORT));
+      ELSE
+         CALL SIO$OUT$BYTE(INPUT(PORT));
+      CALL SIO$GET$CHAR;
+      IF CHAR=ASCR THEN RETURN;
+      GOTO LOOP;
+    END;
+
+ SIO$OUTPUT:
+    /* THIS ROUTINE IMPLEMENTS THE 'OUTPUT' COMMAND. THE USER SUPPLIED
+       DATUM IS OUTPUT TO THE SPECIFIED PORT. */
+    PROCEDURE;
+       DECLARE (DATUM,PORT) WORD;
+       CALL SIO$TEST$WORD$MODE;
+       PORT = SIO$GET$WORD;
+       IF CHAR<>',' THEN GOTO ERROR;
+       CALL SIO$GET$CHAR;
+ LOOP:
+       DATUM = SIO$GET$WORD;
+       IF CHAR=':' THEN GOTO ERROR;
+       IF WORD$MODE THEN
+          OUTWORD(PORT) = DATUM;
+       ELSE
+          OUTPUT(PORT) = LOW(DATUM);
+       IF CHAR=',' THEN
+          DO;
+          CALL SIO$CRLF;
+          CALL SIO$OUT$CHAR('-');
+          CALL SIO$OUT$BLANK;
+          CALL SIO$GET$CHAR;
+          IF CHAR <> ASCR THEN GOTO LOOP;
+          END;
+       RETURN;
+    END;
+
+ SIO$WRITE:
+    /* IMPLEMENTS THE PAPER TAPE WRITE COMMAND. */
+    PROCEDURE;
+       CALL SIO$GET$CHAR;
+       MODE$8086 = TRUE;
+       IF CHAR='X' THEN                 /* TEST FOR 8080 MODE */
+          DO;
+          MODE$8086 = FALSE;
+          CALL SIO$GET$CHAR;
+          END;
+       IF CHAR=ASBL THEN CALL SIO$GET$CHAR;
+       SAVE$MODE = TAPE OR SERIAL;
+       CALL SIO$WRITE$HEX$FILE;
+       RETURN;
+    END SIO$WRITE;
+
+ SIO$READ:
+    /* THIS PROCEDURE IMPLEMENTS THE PAPER TAPE READ COMMAND */
+    PROCEDURE;
+       CALL SIO$SCAN$BLANK;
+       SAVE$MODE = TAPE OR SERIAL;
+       CALL SIO$READ$HEX$FILE;
+       RETURN;
+    END SIO$READ;
+
+
+ SIO$TRANSFER:
+    /* THIS PROCEDURE IMPLEMENTS THE TRANSFER COMMAND */
+    PROCEDURE;
+       CALL SIO$GET$CHAR;
+       MODE$8086 = TRUE;
+       IF CHAR = 'X' THEN
+          DO;
+          MODE$8086 = FALSE;
+          CALL SIO$GET$CHAR;
+          END;
+       IF CHAR = ASBL THEN CALL SIO$GET$CHAR;
+       IF CHAR = 'S' THEN SAVE$MODE = SERIAL;
+       ELSE IF CHAR = 'P' THEN SAVE$MODE = PARALLEL;
+       ELSE GOTO ERROR;
+       CALL SIO$GET$CHAR;
+       IF CHAR <> ',' THEN GOTO ERROR;
+       CALL SIO$GET$CHAR;
+       CALL SIO$WRITE$HEX$FILE;
+       RETURN;
+    END SIO$TRANSFER;
+
+ SIO$LOAD:
+    /* THIS PROCEDURE IMPLEMENTS THE LOAD COMMAND */
+    PROCEDURE;
+       CALL SIO$SCAN$BLANK;
+       IF CHAR = 'S' THEN SAVE$MODE = SERIAL;
+       ELSE IF CHAR = 'P' THEN SAVE$MODE = PARALLEL;
+       ELSE GOTO ERROR;
+       CALL SIO$GET$CHAR;
+       IF CHAR = ',' THEN DO;
+          CALL SIO$GET$CHAR;
+          IF CHAR = ASCR THEN GOTO ERROR;
+          END;
+       ELSE IF CHAR <> ASCR THEN GOTO ERROR;
+       CALL SIO$READ$HEX$FILE;
+       RETURN;
+    END SIO$LOAD;
+
+    /*****************************************
+    *   COMMAND DISPATCH MAIN PROGRAM LOOP   *
+    *****************************************/
+
+       DISABLE;
+       MODE = SERIAL;
+
+    /* THE FOLLOWING CODE DETERMINES THE BAUD RATE  OF THE SERIAL
+       INTERFACE BASED ON TWO 'U'S TYPED IN AT THE CONSOLE.  IT
+       INITIALIZES BOTH THE 8251A USART AND COUNTER 2 OF THE 8253
+       INTERVAL TIMER */
+
+       CALL SIO$RESET$USART;
+       OUTPUT(SIO$STAT$PORT) = SIO$CRT$MODE;
+       OUTPUT(IT$CONTROL$PORT) = IT$C2M3;
+       DO WHILE TRUE;
+          BRF = B9600;
+          OUTPUT(SIO$STAT$PORT) = SIO$CRT$CMD;
+          OUTPUT(IT$CTR2$PORT) = LOW(BRF);
+          OUTPUT(IT$CTR2$PORT) = HIGH(BRF);
+          DO II = 1 TO 1000;
+             CALL SIO$MS$DELAY(1);
+             IF SIO$CHAR$RDY THEN
+                DO;
+                IF (CHAR := INPUT(SIO$DATA$PORT)) = 80H THEN
+                   DO;
+                   BRF = B1200;
+                   GOTO SBC$INIT5;
+                   END;
+                CHAR = CHAR AND PARITY$MASK;
+                DO I = 0 TO 2;
+                   IF CHAR = BR$CHAR(I) THEN GOTO SBC$INIT5;
+                   ELSE BRF = 2*BRF;
+                END;
+                BRF = 2*BRF;
+                OUTPUT(IT$CTR2$PORT) = LOW(BRF);
+                OUTPUT(IT$CTR2$PORT) = HIGH(BRF);
+                CALL SIO$MS$DELAY(120);
+                CHAR = INPUT(SIO$DATA$PORT);
+                DO JJ = 1 TO 3000;
+                   CALL SIO$MS$DELAY(1);
+                   IF SIO$CHAR$RDY THEN
+                      DO;
+                      CHAR = INPUT(SIO$DATA$PORT) AND PARITY$MASK;
+                      DO I = 0 TO 2;
+                         IF CHAR = BR$CHAR(I) THEN GOTO SBC$INIT5;
+                         ELSE BRF = 2*BRF;
+                      END;
+                      CALL SIO$RESET$USART;
+                      OUTPUT(SIO$STAT$PORT) = SIO$TTY$MODE;
+                      CHAR = 0;
+                      OUTPUT(SIO$STAT$PORT) = SIO$TTY$CMD;
+                      BRF = B110;
+                      GOTO SBC$INIT5;
+                      END;
+                END;
+                END;
+          END;
+       END;
+
+ SBC$INIT5:
+       OUTPUT(IT$CTR2$PORT) = LOW(BRF);
+       OUTPUT(IT$CTR2$PORT) = HIGH(BRF);
+       CALL SIO$MS$DELAY(200);
+       CHAR = INPUT(SIO$DATA$PORT);
+       CALL SIO$OUT$STRING(@SIO$SIGNON);
+
+    /* THE FOLLOWING CODE INITIALIZES THE 8259A.  THE STARTING ADDRESS
+       OF ITS 20H BYTE VECTOR TABLE IS 80H.  IT IS PROGRAMMED FOR
+       THE FULLY NESTED MODE.  ALL INTERRUPTS ARE SET UNMASKED. */
+
+       OUTPUT(IC$PORTA) = IC$ICW1;
+       OUTPUT(IC$PORTB) = IC$ICW2;
+       OUTPUT(IC$PORTB) = IC$ICW4;
+       OUTPUT(IC$PORTB) = IC$MASK;
+
+       /* INITIALIZE USER'S REGISTERS */
+       CS,SS,DS,ES,FL,IP = 0;
+       SP = USER$INIT$SP;
+
+       /* INITIALIZE INTERRUPT VECTORS */
+       CALL INIT$INT$VECTOR(@INT$VECTOR(1),.INTERRUPT1$ENTRY);
+       CALL INIT$INT$VECTOR(@INT$VECTOR(2),.INTERRUPT3$ENTRY);
+       CALL INIT$INT$VECTOR(@INT$VECTOR(3),.INTERRUPT3$ENTRY);
+       DO I = 32 TO 39;
+          CALL INIT$INT$VECTOR(@INT$VECTOR(I),.INTERRUPT32$ENTRY);
+       END;
+
+       INT3$PTR = INT$VECTOR(3);  /* SAVE VECTOR 3 */
+       BRK1$FLAG,BRK2$FLAG,SWITCH$BAUD = FALSE;
+
+       MONITOR$STACKPTR = STACKPTR;
+       MONITOR$STACKBASE = STACKBASE;
+
+ NEXT$COMMAND:
+    /* THIS IS THE PERPETUAL COMMAND LOOP WHICH DISPATCHES TO EACH
+       COMMAND WHICH IS A SEPARATE PROCEDURE. */
+
+       CALL SIO$CRLF;
+       CALL SIO$OUT$CHAR(0);
+       CALL SIO$OUT$CHAR('.');
+       IF SWITCH$BAUD THEN
+          DO;
+          /* BAUD RATE WAS CHANGED FOR LOAD OR TRANSFER.  RESTORE
+             ORIGINAL BAUD RATE. */
+          CALL SIO$SECOND$DELAY;
+          SWITCH$BAUD = FALSE;
+          CALL SIO$RESET$USART;
+          OUTPUT(SIO$STAT$PORT) = SIO$CRT$MODE;
+          OUTPUT(IT$CONTROL$PORT) = IT$C2M3;
+          OUTPUT(SIO$STAT$PORT) = SIO$CRT$CMD;
+          OUTPUT(IT$CTR2$PORT) = LOW(BRF);
+          OUTPUT(IT$CTR2$PORT) = HIGH(BRF);
+          END;
+
+       CALL SIO$GET$CHAR;
+       DO I=0 TO LAST(SIO$CMND);
+          IF CHAR=SIO$CMND(I) THEN GOTO DISPATCH;
+       END;
+       GOTO ERROR;
+ DISPATCH:
+       LAST$COMMAND = I;
+       DO CASE I;
+          CALL SIO$EXAM$MEM;
+          CALL SIO$EXAM$REG;
+          CALL SIO$GO;
+          CALL SIO$SINGLE$STEP;
+          CALL SIO$MOVE;
+          CALL SIO$DISPLAY;
+          CALL SIO$COMPARE;
+          CALL SIO$FIND;
+          CALL SIO$HEX$ARITH;
+          CALL SIO$INPUT;
+          CALL SIO$OUTPUT;
+          CALL SIO$READ;
+          CALL SIO$WRITE;
+          CALL SIO$LOAD;
+          CALL SIO$TRANSFER;
+       END;
+       GOTO NEXT$COMMAND;
+
+ ERROR:
+    /* THIS ROUTINE HANDLES ALL ERRORS DETECTED BY THE MONITOR AND
+       WILL OUTPUT THE ERROR PROMPT TO THE OUTPUT PORT.*/
+
+       MODE = SERIAL;
+       IF BRK1$FLAG THEN
+          DO;  /* ERROR IN ENTERING BREAKPOINT 2 */
+          MEMORY$BRK1 = BRK1$SAVE;
+          BRK1$FLAG = FALSE;
+          END;
+       CALL SIO$OUT$CHAR('#');
+       CALL SIO$MS$DELAY(200);
+       GOTO NEXT$COMMAND;
+
+ AFTER$INTERRUPT:
+    /* THIS ROUTINE IS CALLED AFTER AN INTERRUPT TO DISPLAY THE CS:IP
+       AND RESTORE BREAKPOINTED INSTRUCTION(S). */
+
+       IF BRK1$FLAG THEN
+          DO;
+          IF BRK2$FLAG THEN
+             DO;
+             MEMORY$BRK2 = BRK2$SAVE;
+             BRK2$FLAG = FALSE;
+             IF ((IP-1) AND 000FH)=(BRK2.OFF AND 000FH) AND
+                (SHR(IP-1,4)+CS)=(SHR(BRK2.OFF,4)+BRK2.SEG) THEN
+                   DO;
+                   IP=IP-1;
+                   CALL SIO$OUT$STRING(@SIO$BREAK2$MSG);
+                   END;
+             END;
+          MEMORY$BRK1 = BRK1$SAVE;
+          BRK1$FLAG = FALSE;
+          IF ((IP-1) AND 000FH)=(BRK1.OFF AND 000FH) AND
+               (SHR(IP-1,4)+CS)=(SHR(BRK1.OFF,4)+BRK1.SEG) THEN
+             DO;
+             IP = IP - 1;
+             CALL SIO$OUT$STRING(@SIO$BREAK1$MSG);
+             END;
+          END;
+       CALL SIO$OUT$CHAR('@');
+       CALL SIO$OUT$WORD(CS);
+       CALL SIO$OUT$CHAR(':');
+       CALL SIO$OUT$WORD(IP);
+       CALL SIO$OUT$BLANK;
+       CSIP.SEG = CS;
+       CSIP.OFF = IP;
+       CALL SIO$OUT$BYTE$PTR(MEMORY$CSIP$PTR);
+       GOTO NEXT$COMMAND;
+
+    END MONITOR;       /* END OF MODULE */
+ EOF
